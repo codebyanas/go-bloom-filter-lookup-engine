@@ -11,6 +11,6 @@ import (
 type User struct {
 	ID        int64
 	Username  string
-	Email     string
+	Name      string
 	CreatedAt pgtype.Timestamptz
 }

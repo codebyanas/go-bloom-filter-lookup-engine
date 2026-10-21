@@ -5,8 +5,8 @@ SELECT EXISTS(
 
 -- name: CreateUser :one
 INSERT INTO users (
-    username, email
+    username, name
 ) VALUES (
     $1, $2
 )
-RETURNING id, username, email, created_at;
+RETURNING id, username, name, created_at;

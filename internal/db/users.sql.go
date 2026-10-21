@@ -24,25 +24,25 @@ func (q *Queries) CheckUsernameExists(ctx context.Context, username string) (boo
 
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (
-    username, email
+    username, name
 ) VALUES (
     $1, $2
 )
-RETURNING id, username, email, created_at
+RETURNING id, username, name, created_at
 `
 
 type CreateUserParams struct {
 	Username string
-	Email    string
+	Name     string
 }
 
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, createUser, arg.Username, arg.Email)
+	row := q.db.QueryRow(ctx, createUser, arg.Username, arg.Name)
 	var i User
 	err := row.Scan(
 		&i.ID,
 		&i.Username,
-		&i.Email,
+		&i.Name,
 		&i.CreatedAt,
 	)
 	return i, err
