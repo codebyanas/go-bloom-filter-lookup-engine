@@ -1,11 +1,13 @@
-# Distributed Sub-Millisecond Identity Lookup Engine in Go
+# Go Bloom Filter Lookup Engine
 
 [![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![RedisBloom](https://img.shields.io/badge/RedisBloom-Redis%20Stack-DC382D?logo=redis&logoColor=white)](https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A production-oriented Go service for checking username availability at scale. It uses a RedisBloom probabilistic filter as a fast rejection tier and PostgreSQL as the authoritative source of truth. The design removes database I/O entirely for usernames that are definitely not present, while preserving correctness by validating Bloom-filter positives against PostgreSQL.
+Two-tier username availability service in Go: RedisBloom as a fast rejection tier, PostgreSQL as the source of truth.
+
+A high-performance Go service for checking username availability at scale. It uses a RedisBloom probabilistic filter as a fast rejection tier and PostgreSQL as the authoritative source of truth. The design removes database I/O entirely for usernames that are definitely not present, while preserving correctness by validating Bloom-filter positives against PostgreSQL.
 
 ## Problem and solution
 
@@ -56,9 +58,9 @@ Because Bloom filters have no false negatives, the first result is safe: a negat
 - The generated `sqlc` query uses `SELECT EXISTS(...)` for a minimal indexed existence check.
 - A Bloom-positive lookup is taken if the row exists and available if it does not.
 
-### Database I/O bypass
+### Database bypass
 
-For every Bloom-negative request, the service returns from the Redis result without calling PostgreSQL. This is a **100% database disk-I/O bypass for non-existent users** on the lookup path: PostgreSQL is not contacted for those requests, so there is no database query, index traversal, buffer lookup, or possible disk read. Only Bloom-positive requests reach the fallback query.
+For every Bloom-negative request, the service returns from the Redis result without calling PostgreSQL. Bloom-negative requests skip PostgreSQL on the lookup path: PostgreSQL is not contacted for those requests, so there is no database query, index traversal, buffer lookup, or possible disk read. Only Bloom-positive requests reach the fallback query.
 
 ## Features and performance
 
@@ -66,14 +68,18 @@ For every Bloom-negative request, the service returns from the Redis result with
 | --- | --- |
 | Seeded dataset | 1,000,000 deterministic users (`user_1` through `user_1000000`) |
 | Bloom capacity | 10,000,000 users, 1% target error rate |
-| Tier 1 latency | Approximately **0.64 ms** for Bloom rejection |
-| Tier 2 latency | Approximately **2.16 ms** for PostgreSQL fallback |
+| Tier 1 latency | Approximately **0.65 ms** for Bloom rejection |
+| Tier 2 latency | Approximately **2.17 ms** for PostgreSQL fallback |
 | PostgreSQL bulk load | `pgx.CopyFrom` using PostgreSQL's binary `COPY` protocol |
 | Redis bulk load | Redis pipeline with batched `BF.ADD` commands |
 | Latency observability | Separate `redis_latency_ms` and `total_latency_ms` response fields |
 | Persistence | Docker-managed PostgreSQL and Redis volumes |
 
-The latency figures are representative benchmark targets for this design and environment, not a guarantee for every machine or deployment. Network distance, container resources, dataset state, concurrency, and storage all affect measured results.
+### Benchmark environment
+
+Latency figures were measured on a single local machine (Go app running inside WSL2, Docker for PostgreSQL and Redis, 1M seeded users). Machine: `[CPU, RAM, OS: fill in]`. Results will vary with hardware, network distance, dataset state, and load.
+
+Running the Go app on the Windows host while Redis and PostgreSQL ran in Docker's WSL2 VM added several milliseconds per request from the host-to-VM network hop. Running the app inside WSL2 removed that overhead, which is why WSL2/Linux is recommended for reproducing these numbers.
 
 ### Seed path
 
@@ -84,6 +90,14 @@ The latency figures are representative benchmark targets for this design and env
 - `redis_latency_ms` measures the RedisBloom lookup itself.
 - `total_latency_ms` measures the complete HTTP handler path, including Redis and, when required, PostgreSQL.
 - `source` identifies the path used: `bloom` for a Bloom-negative response and `database` for a Bloom-positive response validated by PostgreSQL.
+
+## Limitations and trade-offs
+
+- **No deletions:** Bloom filters cannot remove entries, so freed-up usernames stay flagged as "maybe present" and fall through to PostgreSQL (still correct, just not fast). A periodic rebuild or a counting/cuckoo filter would fix this.
+- **False positives:** Roughly 1% of available usernames at full capacity are sent to PostgreSQL. This costs latency, never correctness.
+- **Capacity:** The filter is sized for 10M entries. Going far beyond that raises the false-positive rate.
+- **Register consistency:** If the Bloom add fails after a successful database insert, the filter can miss a taken username. The UNIQUE constraint on users.username still prevents duplicate registrations, but the availability check may wrongly report "available" until the filter is repaired.
+- **Scope:** Benchmarks are single-request latency measurements, not a concurrent load test.
 
 ## Tech stack
 
@@ -232,17 +246,17 @@ Checks whether a username is available.
 #### Available username: Tier 1 Bloom rejection
 
 ```bash
-curl "http://localhost:8080/check?username=brand_new_user"
+curl "http://localhost:8080/check?username=random_non_existent_99"
 ```
 
 ```json
 {
-  "username": "brand_new_user",
   "available": true,
   "message": "Username is available",
+  "redis_latency_ms": 0.644,
   "source": "bloom",
-  "redis_latency_ms": 0.64,
-  "total_latency_ms": 0.71
+  "total_latency_ms": 0.648,
+  "username": "random_non_existent_99"
 }
 ```
 
@@ -251,17 +265,17 @@ curl "http://localhost:8080/check?username=brand_new_user"
 #### Taken username: Tier 2 PostgreSQL validation
 
 ```bash
-curl "http://localhost:8080/check?username=user_42"
+curl "http://localhost:8080/check?username=user_500000"
 ```
 
 ```json
 {
-  "username": "user_42",
   "available": false,
   "message": "Username is already taken",
+  "redis_latency_ms": 0.677,
   "source": "database",
-  "redis_latency_ms": 0.64,
-  "total_latency_ms": 2.16
+  "total_latency_ms": 2.165,
+  "username": "user_500000"
 }
 ```
 
@@ -277,7 +291,7 @@ curl -X POST "http://localhost:8080/register" \
   -d '{"username":"new_user","name":"New User"}'
 ```
 
-The endpoint returns `201 Created` with the created user record. A database write can succeed even if the subsequent Bloom synchronization fails; the service reports that error explicitly so it can be repaired operationally.
+The endpoint returns `201 Created` with the created user record. A database write can succeed even if the subsequent Bloom synchronization fails; the service reports that error explicitly so it can be repaired operationally. See [Limitations and trade-offs](#limitations-and-trade-offs) for the consistency implications.
 
 ## Regenerating sqlc code
 
